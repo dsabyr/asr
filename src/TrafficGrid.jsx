@@ -44,16 +44,17 @@ function TrafficGrid({ state, onCellClick, speed = 100 }) {
   const getX = (col) => ROAD_WIDTH + col * CELL + CELL / 2;
   const getY = (row) => ROAD_WIDTH + row * CELL + CELL / 2;
 
-  // Group cars by position to compute stacking offsets
+  // Index moving cars by node (at most 1 per node now, but kept for safety)
   const carPositions = {};
   for (const car of state.cars) {
+    if (car.waiting) continue;
     const pos = getCarPosition(car);
     const key = `${pos.row}-${pos.col}`;
     if (!carPositions[key]) carPositions[key] = [];
     carPositions[key].push(car);
   }
 
-  // Count waiting cars per intersection
+  // Count waiting cars per intersection (for the badge)
   const waitingCount = {};
   for (const car of state.cars) {
     if (!car.waiting) continue;
@@ -61,6 +62,29 @@ function TrafficGrid({ state, onCellClick, speed = 100 }) {
     const key = `${pos.row}-${pos.col}`;
     waitingCount[key] = (waitingCount[key] || 0) + 1;
   }
+
+  // Build per-lane queues for waiting cars.
+  // Key = "row-col-dr-dc" (intersection + approach direction).
+  // Sorted by car id ascending: lower id = arrived earlier = front of queue.
+  const waitQueues = {};
+  for (const car of state.cars) {
+    if (!car.waiting || car.pathIndex === 0) continue;
+    const cur = car.path[car.pathIndex];
+    const prev = car.path[car.pathIndex - 1];
+    const dr = prev.row - cur.row;
+    const dc = prev.col - cur.col;
+    const qKey = `${cur.row}-${cur.col}-${dr}-${dc}`;
+    if (!waitQueues[qKey]) waitQueues[qKey] = [];
+    waitQueues[qKey].push(car.id);
+  }
+  for (const key of Object.keys(waitQueues)) {
+    waitQueues[key].sort((a, b) => a - b);
+  }
+
+  // Distance from intersection centre to the front of the queue (px)
+  const QUEUE_START = INTERSECTION_R + 8;
+  // Gap between consecutive waiting cars (px)
+  const QUEUE_GAP = 13;
 
   // Transition duration: slightly shorter than the tick interval so motion
   // always completes before the next state update arrives.
@@ -195,22 +219,34 @@ function TrafficGrid({ state, onCellClick, speed = 100 }) {
 
       {/* Cars — each rendered individually for smooth CSS-transition animation */}
       {state.cars.map((car) => {
-        const pos = getCarPosition(car);
-        const key = `${pos.row}-${pos.col}`;
-        const siblings = carPositions[key] || [];
-        const idx = siblings.indexOf(car);
-        const count = Math.min(siblings.length, 6);
+        const { path, pathIndex, waiting } = car;
+        const cur = path[pathIndex];
+        let cx, cy;
 
-        // Spread overlapping cars around the intersection node
-        const spreadAngle = count > 1 ? (idx / count) * Math.PI * 2 : 0;
-        const spread = count > 1 ? 8 : 0;
-        const ox = Math.cos(spreadAngle) * spread;
-        const oy = Math.sin(spreadAngle) * spread;
+        if (waiting && pathIndex > 0) {
+          // Place car on the road before the intersection, in a queue
+          const prev = path[pathIndex - 1];
+          const dr = prev.row - cur.row;
+          const dc = prev.col - cur.col;
+          const qKey = `${cur.row}-${cur.col}-${dr}-${dc}`;
+          const qIdx = waitQueues[qKey]?.indexOf(car.id) ?? 0;
+          const offset = QUEUE_START + qIdx * QUEUE_GAP;
+          cx = getX(cur.col) + dc * offset;
+          cy = getY(cur.row) + dr * offset;
+        } else {
+          // Moving: spread cars that share the same intersection
+          const key = `${cur.row}-${cur.col}`;
+          const siblings = carPositions[key] || [];
+          const idx = siblings.indexOf(car);
+          const count = Math.min(siblings.length, 6);
+          const spreadAngle = count > 1 ? (idx / count) * Math.PI * 2 : 0;
+          const spread = count > 1 ? 8 : 0;
+          cx = getX(cur.col) + Math.cos(spreadAngle) * spread;
+          cy = getY(cur.row) + Math.sin(spreadAngle) * spread;
+        }
 
-        const cx = getX(pos.col) + ox;
-        const cy = getY(pos.row) + oy;
         const angle = getCarAngle(car);
-        const color = car.waiting ? '#ffaa00' : '#00ccff';
+        const color = waiting ? '#ffaa00' : '#00ccff';
 
         return (
           <g

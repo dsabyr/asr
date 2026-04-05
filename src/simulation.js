@@ -10,6 +10,10 @@ const DIRS = [
 
 const GRID_SIZE = 10;
 const DEFAULT_PHASE = 12;
+const MIN_PHASE = 4;
+const MAX_PHASE = 30;
+const SAT_FLOW = 3;   // saturation flow per approach (cars/tick)
+const LOST_TIME = 4;  // total lost time per cycle (ticks)
 const MAX_CARS = 120;
 
 let nextCarId = 1;
@@ -50,6 +54,7 @@ export function createSimState() {
     },
     accidents: [],
     spawnRate: 3,
+    controlMode: 'standard', // 'standard' | 'webster' | 'adaptive'
   };
 }
 
@@ -95,7 +100,7 @@ export function findPath(grid, startR, startC, endR, endC) {
   return null;
 }
 
-function spawnCar(state) {
+function spawnCar(state, occupied) {
   if (state.cars.length >= MAX_CARS) return null;
 
   const edges = [];
@@ -106,33 +111,41 @@ function spawnCar(state) {
     edges.push({ r: i, c: GRID_SIZE - 1 });
   }
 
-  const start = edges[Math.floor(Math.random() * edges.length)];
+  // Shuffle to avoid always trying the same edges first
+  for (let i = edges.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [edges[i], edges[j]] = [edges[j], edges[i]];
+  }
 
-  let dest;
-  let attempts = 0;
-  do {
-    dest = edges[Math.floor(Math.random() * edges.length)];
-    attempts++;
-  } while (dest.r === start.r && dest.c === start.c && attempts < 20);
+  for (const start of edges) {
+    if (state.grid[start.r][start.c].hasAccident) continue;
+    if (occupied.has(`${start.r}-${start.c}`)) continue;
 
-  if (dest.r === start.r && dest.c === start.c) return null;
-  if (state.grid[start.r][start.c].hasAccident) return null;
+    let dest;
+    let attempts = 0;
+    do {
+      dest = edges[Math.floor(Math.random() * edges.length)];
+      attempts++;
+    } while (dest.r === start.r && dest.c === start.c && attempts < 20);
+    if (dest.r === start.r && dest.c === start.c) continue;
 
-  const path = findPath(state.grid, start.r, start.c, dest.r, dest.c);
-  if (!path || path.length < 2) return null;
+    const path = findPath(state.grid, start.r, start.c, dest.r, dest.c);
+    if (!path || path.length < 2) continue;
 
-  return {
-    id: nextCarId++,
-    path,
-    pathIndex: 0,
-    row: start.r,
-    col: start.c,
-    destRow: dest.r,
-    destCol: dest.c,
-    waiting: false,
-    waitTime: 0,
-    travelTime: 0,
-  };
+    return {
+      id: nextCarId++,
+      path,
+      pathIndex: 0,
+      row: start.r,
+      col: start.c,
+      destRow: dest.r,
+      destCol: dest.c,
+      waiting: false,
+      waitTime: 0,
+      travelTime: 0,
+    };
+  }
+  return null;
 }
 
 function getDirectionBetween(fromR, fromC, toR, toC) {
@@ -161,38 +174,97 @@ export function simulateTick(state) {
 
   const tick = state.tick + 1;
 
+  // Precompute per-intersection NS/EW waiting queues (used by Webster & Adaptive)
+  const nsQueue = {};
+  const ewQueue = {};
+  if (state.controlMode !== 'standard') {
+    for (const car of state.cars) {
+      if (!car.waiting || car.pathIndex >= car.path.length - 1) continue;
+      const cur = car.path[car.pathIndex];
+      const next = car.path[car.pathIndex + 1];
+      const dir = getDirectionBetween(cur.row, cur.col, next.row, next.col);
+      const key = `${cur.row}-${cur.col}`;
+      if (dir === 'north' || dir === 'south') nsQueue[key] = (nsQueue[key] || 0) + 1;
+      else ewQueue[key] = (ewQueue[key] || 0) + 1;
+    }
+  }
+
   // Update traffic light phases
   for (let r = 0; r < GRID_SIZE; r++) {
     for (let c = 0; c < GRID_SIZE; c++) {
       const inter = grid[r][c];
-      inter.phaseTimer++;
-      if (inter.phaseTimer >= inter.phaseDuration) {
-        inter.phaseTimer = 0;
-        inter.phase = inter.phase === 'ns' ? 'ew' : 'ns';
-      }
 
+      // Accident countdown — freeze all phase logic while active
       if (inter.hasAccident) {
         inter.accidentTimer--;
         if (inter.accidentTimer <= 0) {
           inter.hasAccident = false;
           inter.accidentTimer = 0;
           inter.phaseDuration = DEFAULT_PHASE;
-          accidents = accidents.filter(
-            (a) => !(a.row === r && a.col === c)
-          );
+          accidents = accidents.filter((a) => !(a.row === r && a.col === c));
         }
+        continue;
+      }
+
+      // Adaptive: trigger early switch when green queue is empty but red queue is not
+      if (state.controlMode === 'adaptive' && inter.phaseTimer >= MIN_PHASE) {
+        const key = `${r}-${c}`;
+        const greenQ = inter.phase === 'ns' ? (nsQueue[key] || 0) : (ewQueue[key] || 0);
+        const redQ   = inter.phase === 'ns' ? (ewQueue[key] || 0) : (nsQueue[key] || 0);
+        if (greenQ === 0 && redQ > 0) {
+          inter.phaseTimer = inter.phaseDuration - 1; // forces switch on next ++
+        }
+      }
+
+      inter.phaseTimer++;
+      if (inter.phaseTimer >= inter.phaseDuration) {
+        inter.phaseTimer = 0;
+        inter.phase = inter.phase === 'ns' ? 'ew' : 'ns';
+
+        // Compute duration for the new phase
+        const key = `${r}-${c}`;
+        if (state.controlMode === 'webster') {
+          const qNS = nsQueue[key] || 0;
+          const qEW = ewQueue[key] || 0;
+          const yNS = Math.min(qNS / SAT_FLOW, 0.45);
+          const yEW = Math.min(qEW / SAT_FLOW, 0.45);
+          const Y   = Math.min(yNS + yEW, 0.9);
+          const C   = Math.max(MIN_PHASE * 2, Math.min(MAX_PHASE * 2,
+                        Math.round((1.5 * LOST_TIME + 5) / (1 - Y))));
+          const green = C - LOST_TIME;
+          const total = yNS + yEW || 1;
+          const nsG = Math.max(MIN_PHASE, Math.round(green * yNS / total));
+          const ewG = Math.max(MIN_PHASE, Math.round(green * yEW / total));
+          inter.phaseDuration = inter.phase === 'ns' ? nsG : ewG;
+        } else if (state.controlMode === 'adaptive') {
+          const inQ = inter.phase === 'ns' ? (nsQueue[key] || 0) : (ewQueue[key] || 0);
+          const outQ = inter.phase === 'ns' ? (ewQueue[key] || 0) : (nsQueue[key] || 0);
+          const total = inQ + outQ || 1;
+          const ratio = inQ / total;
+          inter.phaseDuration = Math.max(MIN_PHASE,
+            Math.min(MAX_PHASE, Math.round(MIN_PHASE + ratio * (MAX_PHASE - MIN_PHASE))));
+        }
+        // standard: phaseDuration stays unchanged
       }
     }
   }
 
-  // Move cars
+  // Move cars — process front-to-back (highest pathIndex first) so leading
+  // cars clear their node before followers attempt to advance.
   const carsToRemove = new Set();
+  // Tracks which nodes are claimed for next tick; prevents overlapping.
+  const nextOccupied = new Set();
 
-  for (let i = 0; i < cars.length; i++) {
+  const order = [...Array(cars.length).keys()].sort(
+    (a, b) => cars[b].pathIndex - cars[a].pathIndex
+  );
+
+  for (const i of order) {
     const car = cars[i];
     car.travelTime++;
 
     if (car.pathIndex >= car.path.length - 1) {
+      // Car exits — frees its node, no reservation needed
       carsToRemove.add(i);
       stats.exited++;
       stats.completedTrips++;
@@ -202,9 +274,11 @@ export function simulateTick(state) {
     }
 
     const current = car.path[car.pathIndex];
-    const next = car.path[car.pathIndex + 1];
+    const next    = car.path[car.pathIndex + 1];
+    const curKey  = `${current.row}-${current.col}`;
+    const nextKey = `${next.row}-${next.col}`;
 
-    // Reroute if next intersection has accident
+    // Reroute if next node has accident
     if (grid[next.row][next.col].hasAccident) {
       const newPath = findPath(grid, current.row, current.col, car.destRow, car.destCol);
       if (newPath && newPath.length >= 2) {
@@ -214,19 +288,24 @@ export function simulateTick(state) {
         car.waiting = true;
         car.waitTime++;
       }
+      nextOccupied.add(curKey);
       continue;
     }
 
-    const direction = getDirectionBetween(current.row, current.col, next.row, next.col);
+    const direction  = getDirectionBetween(current.row, current.col, next.row, next.col);
+    const lightGreen = canPass(grid[current.row][current.col], direction);
+    const nextFree   = !nextOccupied.has(nextKey);
 
-    if (canPass(grid[current.row][current.col], direction)) {
+    if (lightGreen && nextFree) {
       car.pathIndex++;
-      car.row = next.row;
-      car.col = next.col;
+      car.row     = next.row;
+      car.col     = next.col;
       car.waiting = false;
+      nextOccupied.add(nextKey);
     } else {
       car.waiting = true;
       car.waitTime++;
+      nextOccupied.add(curKey);
     }
   }
 
@@ -240,12 +319,22 @@ export function simulateTick(state) {
     stats,
     accidents,
     spawnRate: state.spawnRate,
+    controlMode: state.controlMode,
   };
+
+  // Build occupancy set from cars that survived this tick
+  const spawnOccupied = new Set(
+    remainingCars.map((c) => {
+      const cur = c.path[c.pathIndex];
+      return `${cur.row}-${cur.col}`;
+    })
+  );
 
   for (let i = 0; i < state.spawnRate; i++) {
     if (Math.random() < 0.5) {
-      const car = spawnCar(newState);
+      const car = spawnCar(newState, spawnOccupied);
       if (car) {
+        spawnOccupied.add(`${car.path[0].row}-${car.path[0].col}`);
         newState.cars.push(car);
         newState.stats.entered++;
       }

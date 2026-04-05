@@ -1,16 +1,29 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import TrafficGrid from './TrafficGrid';
 import StatsPanel from './StatsPanel';
+import CarChart from './CarChart';
 import { createSimState, simulateTick, addAccident } from './simulation';
+
+const HISTORY_MAX = 120;
 
 function App() {
   const [state, setState] = useState(createSimState);
   const [running, setRunning] = useState(false);
   const [speed, setSpeed] = useState(100);
+  const [history, setHistory] = useState([]);
   const intervalRef = useRef(null);
 
   const tick = useCallback(() => {
-    setState((prev) => simulateTick(prev));
+    setState((prev) => {
+      const next = simulateTick(prev);
+      const moving = next.cars.filter((c) => !c.waiting).length;
+      const waiting = next.cars.filter((c) => c.waiting).length;
+      setHistory((h) => {
+        const entry = { tick: next.tick, moving, waiting };
+        return h.length >= HISTORY_MAX ? [...h.slice(1), entry] : [...h, entry];
+      });
+      return next;
+    });
   }, []);
 
   useEffect(() => {
@@ -29,6 +42,7 @@ function App() {
   const handleReset = () => {
     setRunning(false);
     setState(createSimState());
+    setHistory([]);
   };
 
   const handleSpawnRate = (val) => {
@@ -89,6 +103,29 @@ function App() {
             style={styles.slider}
           />
         </div>
+
+        <div style={styles.modeGroup}>
+          <label style={styles.sliderLabel}>Режим светофора</label>
+          <div style={{ display: 'flex', gap: 4 }}>
+            {[
+              { id: 'standard', label: 'Стандарт' },
+              { id: 'webster', label: 'Вебстер' },
+              { id: 'adaptive', label: 'Адаптив' },
+            ].map(({ id, label }) => (
+              <button
+                key={id}
+                onClick={() => setState((prev) => ({ ...prev, controlMode: id }))}
+                style={{
+                  ...styles.modeBtn,
+                  background: state.controlMode === id ? '#3366ff' : '#2a2a4a',
+                  borderColor: state.controlMode === id ? '#5588ff' : '#3a3a5a',
+                }}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
       </div>
 
       <div style={styles.main}>
@@ -102,7 +139,10 @@ function App() {
             <LegendItem color="#ff2222" label="Авария" />
           </div>
         </div>
-        <StatsPanel state={state} />
+        <div style={styles.rightPanel}>
+          <StatsPanel state={state} />
+          <CarChart history={history} />
+        </div>
       </div>
     </div>
   );
@@ -200,12 +240,32 @@ const styles = {
     flexDirection: 'column',
     gap: 8,
   },
+  rightPanel: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 12,
+  },
   legend: {
     display: 'flex',
     gap: 16,
     justifyContent: 'center',
     flexWrap: 'wrap',
     padding: '8px 0',
+  },
+  modeGroup: {
+    display: 'flex',
+    flexDirection: 'column',
+    alignItems: 'center',
+    gap: 4,
+  },
+  modeBtn: {
+    padding: '5px 10px',
+    border: '1px solid',
+    borderRadius: 5,
+    color: '#fff',
+    fontSize: 12,
+    fontWeight: 600,
+    cursor: 'pointer',
   },
 };
 
