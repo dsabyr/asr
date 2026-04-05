@@ -38,10 +38,10 @@ function App() {
   return (
     <div style={styles.app}>
       <header style={styles.header}>
-        <h1 style={styles.h1}>Smart Traffic Light System</h1>
+        <h1 style={styles.h1}>Умная система управления светофорами</h1>
         <p style={styles.subtitle}>
-          Click any intersection to toggle an accident. Cars reroute automatically
-          and nearby lights adjust phase timing.
+          Нажмите на любой перекрёсток, чтобы создать аварию. Машины автоматически
+          перестраивают маршрут, а ближайшие светофоры корректируют фазы.
         </p>
       </header>
 
@@ -53,18 +53,18 @@ function App() {
             background: running ? '#ff4444' : '#00cc66',
           }}
         >
-          {running ? 'Pause' : 'Start'}
+          {running ? 'Пауза' : 'Старт'}
         </button>
         <button onClick={tick} style={styles.btn} disabled={running}>
-          Step
+          Шаг
         </button>
         <button onClick={handleReset} style={{ ...styles.btn, background: '#666' }}>
-          Reset
+          Сброс
         </button>
 
         <div style={styles.sliderGroup}>
           <label style={styles.sliderLabel}>
-            Speed: {speed}ms
+            Скорость: {speed}мс
           </label>
           <input
             type="range"
@@ -78,7 +78,7 @@ function App() {
 
         <div style={styles.sliderGroup}>
           <label style={styles.sliderLabel}>
-            Spawn Rate: {state.spawnRate}
+            Частота появления: {state.spawnRate}
           </label>
           <input
             type="range"
@@ -95,11 +95,11 @@ function App() {
         <div style={styles.gridContainer}>
           <TrafficGrid state={state} onCellClick={handleCellClick} speed={speed} />
           <div style={styles.legend}>
-            <LegendItem color="#00ff88" label="Green light" />
-            <LegendItem color="#ff4444" label="Red light" />
-            <LegendItem color="#00ccff" label="Moving car" />
-            <LegendItem color="#ffaa00" label="Waiting car" />
-            <LegendItem color="#ff2222" label="Accident" />
+            <LegendItem color="#00ff88" label="Зелёный свет" />
+            <LegendItem color="#ff4444" label="Красный свет" />
+            <LegendItem color="#00ccff" label="Едет" />
+            <LegendItem color="#ffaa00" label="Стоит" />
+            <LegendItem color="#ff2222" label="Авария" />
           </div>
         </div>
         <StatsPanel state={state} />

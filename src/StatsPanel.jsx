@@ -22,39 +22,39 @@ function StatsPanel({ state }) {
 
   return (
     <div style={styles.panel}>
-      <h3 style={styles.title}>Live Statistics</h3>
+      <h3 style={styles.title}>Статистика</h3>
 
       <div style={styles.grid}>
-        <StatCard label="Tick" value={tick} color="#888" />
-        <StatCard label="Cars Entered" value={stats.entered} color="#00ccff" />
-        <StatCard label="Cars Exited" value={stats.exited} color="#00ff88" />
-        <StatCard label="In Grid" value={stats.carsInGrid} color="#ffaa00" />
-        <StatCard label="Moving" value={currentMoving} color="#00ccff" />
-        <StatCard label="Waiting" value={currentWaiting} color="#ff8844" />
-        <StatCard label="Avg Wait Time" value={`${avgWait} ticks`} color="#ff6666" />
-        <StatCard label="Avg Travel Time" value={`${avgTravel} ticks`} color="#aa88ff" />
+        <StatCard label="Такт" value={tick} color="#888" />
+        <StatCard label="Въехало" value={stats.entered} color="#00ccff" />
+        <StatCard label="Выехало" value={stats.exited} color="#00ff88" />
+        <StatCard label="На сетке" value={stats.carsInGrid} color="#ffaa00" />
+        <StatCard label="Едут" value={currentMoving} color="#00ccff" />
+        <StatCard label="Стоят" value={currentWaiting} color="#ff8844" />
+        <StatCard label="Среднее ожидание" value={`${avgWait} т`} color="#ff6666" />
+        <StatCard label="Среднее время пути" value={`${avgTravel} т`} color="#aa88ff" />
         <StatCard
-          label="Flow Rate"
-          value={`${flowRate} cars/60t`}
+          label="Поток"
+          value={`${flowRate} авт/60т`}
           color="#44ddaa"
         />
-        <StatCard label="Throughput" value={`${throughput}%`} color="#ffdd44" />
+        <StatCard label="Пропускная способность" value={`${throughput}%`} color="#ffdd44" />
         <StatCard
-          label="Active Accidents"
+          label="Активные аварии"
           value={accidents.length}
           color={accidents.length > 0 ? '#ff4444' : '#666'}
         />
-        <StatCard label="Completed Trips" value={stats.completedTrips} color="#88ccff" />
+        <StatCard label="Завершено поездок" value={stats.completedTrips} color="#88ccff" />
       </div>
 
       {accidents.length > 0 && (
         <div style={styles.accidentList}>
           <h4 style={{ margin: '8px 0 4px', color: '#ff6666', fontSize: 13 }}>
-            Accident Locations
+            Места аварий
           </h4>
           {accidents.map((a, i) => (
             <div key={i} style={styles.accidentItem}>
-              Intersection ({a.row}, {a.col}) — {state.grid[a.row]?.[a.col]?.accidentTimer ?? 0} ticks remaining
+              Перекрёсток ({a.row}, {a.col}) — осталось {state.grid[a.row]?.[a.col]?.accidentTimer ?? 0} тактов
             </div>
           ))}
         </div>

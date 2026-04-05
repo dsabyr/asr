@@ -235,7 +235,7 @@ function TrafficGrid({ state, onCellClick, speed = 100 }) {
               {/* Front headlight dot */}
               <circle cx={6} cy={0} r={1.5} fill="#fff" opacity={0.7} />
             </g>
-            <title>Car #{car.id} | Wait: {car.waitTime} | Travel: {car.travelTime}</title>
+            <title>Авто #{car.id} | Ожидание: {car.waitTime} | Путь: {car.travelTime}</title>
           </g>
         );
       })}
