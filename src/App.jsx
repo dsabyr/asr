@@ -3,6 +3,9 @@ import TrafficGrid from './TrafficGrid';
 import StatsPanel from './StatsPanel';
 import CarChart from './CarChart';
 import { createSimState, simulateTick, addAccident } from './simulation';
+import CAMCanvas from './components/CAMCanvas.jsx';
+import { createCAMGrid, seedVehicles, syncAccidents } from './cam/grid.js';
+import { camStep, applyWaveMode, getCAMMetrics } from './cam/simulator.js';
 
 const HISTORY_MAX = 120;
 
@@ -13,13 +16,22 @@ function App() {
   const [history, setHistory] = useState([]);
   const intervalRef = useRef(null);
 
+  const [viewMode, setViewMode]     = useState('svg');
+  const [camGrid, setCamGrid]       = useState(() => { const g = createCAMGrid(); seedVehicles(g, 18); return g; });
+  const [camMetrics, setCamMetrics] = useState({});
+  const [waveMode, setWaveMode]     = useState(false);
+  const [camDensity, setCamDensity] = useState(18);
+  const [selInter, setSelInter]     = useState(null);
+  const camIntervalRef              = useRef(null);
+
   const tick = useCallback(() => {
     setState((prev) => {
       const next = simulateTick(prev);
       const moving = next.cars.filter((c) => !c.waiting).length;
       const waiting = next.cars.filter((c) => c.waiting).length;
+      const greenCorridor = next.stats.greenCorridorCount;
       setHistory((h) => {
-        const entry = { tick: next.tick, moving, waiting };
+        const entry = { tick: next.tick, moving, waiting, greenCorridor };
         return h.length >= HISTORY_MAX ? [...h.slice(1), entry] : [...h, entry];
       });
       return next;
@@ -38,6 +50,25 @@ function App() {
   const handleCellClick = (row, col) => {
     setState((prev) => addAccident(prev, row, col));
   };
+
+  useEffect(() => {
+    if (!running || viewMode !== 'cam') {
+      clearInterval(camIntervalRef.current);
+      return;
+    }
+    camIntervalRef.current = setInterval(() => {
+      setCamGrid(prev => {
+        camStep(prev);
+        setCamMetrics(getCAMMetrics(prev));
+        return { ...prev, tick: prev.tick };
+      });
+    }, speed);
+    return () => clearInterval(camIntervalRef.current);
+  }, [running, viewMode, speed]);
+
+  useEffect(() => {
+    setCamGrid(prev => { syncAccidents(prev, state.grid); return { ...prev }; });
+  }, [state.grid]);
 
   const handleReset = () => {
     setRunning(false);
@@ -97,12 +128,41 @@ function App() {
           <input
             type="range"
             min={1}
-            max={8}
+            max={20}
             value={state.spawnRate}
             onChange={(e) => handleSpawnRate(e.target.value)}
             style={styles.slider}
           />
         </div>
+
+        <div style={styles.modeGroup}>
+          <label style={styles.sliderLabel}>Вид</label>
+          <div style={{ display: 'flex', gap: 4 }}>
+            {[{ id: 'svg', label: 'SVG' }, { id: 'cam', label: 'CAM-2D' }].map(({ id, label }) => (
+              <button
+                key={id}
+                onClick={() => setViewMode(id)}
+                style={{ ...styles.modeBtn, background: viewMode === id ? '#3366ff' : '#2a2a4a', borderColor: viewMode === id ? '#5588ff' : '#3a3a5a' }}
+              >{label}</button>
+            ))}
+          </div>
+        </div>
+
+        {viewMode === 'cam' && (
+          <>
+            <div style={styles.modeGroup}>
+              <label style={styles.sliderLabel}>Плотность: {camDensity}%</label>
+              <input type="range" min={3} max={35} value={camDensity}
+                onChange={e => { const v = +e.target.value; setCamDensity(v); setCamGrid(prev => { seedVehicles(prev, v); return { ...prev }; }); }}
+                max={35}
+                style={styles.slider} />
+            </div>
+            <button
+              onClick={() => { const next = !waveMode; setWaveMode(next); setCamGrid(prev => { applyWaveMode(prev, next); return { ...prev }; }); }}
+              style={{ ...styles.modeBtn, background: waveMode ? '#1D9E75' : '#2a2a4a', borderColor: waveMode ? '#1D9E75' : '#3a3a5a' }}
+            >~ Волна</button>
+          </>
+        )}
 
         <div style={styles.modeGroup}>
           <label style={styles.sliderLabel}>Режим светофора</label>
@@ -130,16 +190,40 @@ function App() {
 
       <div style={styles.main}>
         <div style={styles.gridContainer}>
-          <TrafficGrid state={state} onCellClick={handleCellClick} speed={speed} />
-          <div style={styles.legend}>
-            <LegendItem color="#00ff88" label="Зелёный свет" />
-            <LegendItem color="#ff4444" label="Красный свет" />
-            <LegendItem color="#00ccff" label="Едет" />
-            <LegendItem color="#ffaa00" label="Стоит" />
-            <LegendItem color="#ff2222" label="Авария" />
-          </div>
+          {viewMode === 'svg'
+            ? <TrafficGrid state={state} onCellClick={handleCellClick} speed={speed} />
+            : <CAMCanvas camGrid={camGrid} onSelectIntersection={(ix, iy) => setSelInter(ix !== null ? [ix, iy] : null)} />
+          }
+          {viewMode === 'cam' && selInter && (() => {
+            const inter = camGrid.intersections[selInter[1]][selInter[0]];
+            return (
+              <div style={{ fontSize: 12, color: '#aaa', fontFamily: 'monospace', textAlign: 'center', padding: '4px 0' }}>
+                [{selInter[0]},{selInter[1]}] — {inter.phase} — NS {inter.greenNS}т / EW {inter.greenEW}т
+                {camMetrics.vehicles !== undefined && ` | авт: ${camMetrics.vehicles} | v̄: ${camMetrics.avgSpeed}`}
+              </div>
+            );
+          })()}
+          {viewMode === 'svg' && (
+            <div style={styles.legend}>
+              <LegendItem color="#00ff88" label="Зелёный свет" />
+              <LegendItem color="#ff4444" label="Красный свет" />
+              <LegendItem color="#00ccff" label="Едет" />
+              <LegendItem color="#ffaa00" label="Стоит" />
+              <LegendItem color="#ff2222" label="Авария" />
+            </div>
+          )}
+          {viewMode === 'cam' && (
+            <div style={styles.legend}>
+              <LegendItem color="#3B8BD4" label="Стоит" />
+              <LegendItem color="#1D9E75" label="Едет" />
+              <LegendItem color="#EF9F27" label="Быстро" />
+              <LegendItem color="#D4537E" label="Карман" />
+              <LegendItem color="#E24B4A" label="Авария" />
+            </div>
+          )}
         </div>
-        <div style={styles.rightPanel}>
+
+        <div style={styles.bottomPanel}>
           <StatsPanel state={state} />
           <CarChart history={history} />
         </div>
@@ -230,20 +314,21 @@ const styles = {
   },
   main: {
     display: 'flex',
-    justifyContent: 'center',
-    gap: 20,
-    flexWrap: 'wrap',
-    alignItems: 'flex-start',
+    flexDirection: 'column',
+    gap: 16,
   },
   gridContainer: {
     display: 'flex',
     flexDirection: 'column',
     gap: 8,
+    width: '100%',
   },
-  rightPanel: {
+  bottomPanel: {
     display: 'flex',
-    flexDirection: 'column',
-    gap: 12,
+    gap: 20,
+    flexWrap: 'wrap',
+    alignItems: 'flex-start',
+    justifyContent: 'center',
   },
   legend: {
     display: 'flex',

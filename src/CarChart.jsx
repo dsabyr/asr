@@ -19,7 +19,7 @@ function CarChart({ history }) {
   }
 
   const maxCars = Math.max(
-    ...history.map((d) => Math.max(d.moving, d.waiting)),
+    ...history.map((d) => Math.max(d.moving, d.waiting, d.greenCorridor ?? 0)),
     1
   );
 
@@ -28,6 +28,7 @@ function CarChart({ history }) {
 
   const movingPts = history.map((d, i) => [xOf(i), yOf(d.moving)]);
   const waitingPts = history.map((d, i) => [xOf(i), yOf(d.waiting)]);
+  const greenPts = history.map((d, i) => [xOf(i), yOf(d.greenCorridor ?? 0)]);
 
   // Y-axis ticks
   const yTicks = [0, Math.round(maxCars / 2), maxCars];
@@ -42,6 +43,7 @@ function CarChart({ history }) {
       <div style={styles.legend}>
         <LegendDot color="#00ccff" label="Едут" />
         <LegendDot color="#ffaa00" label="Стоят" />
+        <LegendDot color="#00ff88" label="Зел. коридор" />
       </div>
       <svg width={W} height={H} style={{ display: 'block' }}>
         {/* Grid lines */}
@@ -97,9 +99,20 @@ function CarChart({ history }) {
           opacity={0.85}
         />
 
+        {/* Green corridor line */}
+        <polyline
+          points={polyline(greenPts)}
+          fill="none"
+          stroke="#00ff88"
+          strokeWidth={1.5}
+          strokeLinejoin="round"
+          opacity={0.9}
+        />
+
         {/* Latest value dots */}
         <circle cx={movingPts.at(-1)[0]} cy={movingPts.at(-1)[1]} r={3} fill="#00ccff" />
         <circle cx={waitingPts.at(-1)[0]} cy={waitingPts.at(-1)[1]} r={3} fill="#ffaa00" />
+        <circle cx={greenPts.at(-1)[0]} cy={greenPts.at(-1)[1]} r={3} fill="#00ff88" />
       </svg>
     </div>
   );

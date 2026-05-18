@@ -51,6 +51,7 @@ export function createSimState() {
       totalTravelTime: 0,
       completedTrips: 0,
       carsInGrid: 0,
+      greenCorridorCount: 0,
     },
     accidents: [],
     spawnRate: 3,
@@ -169,7 +170,7 @@ export function simulateTick(state) {
     row.map((cell) => ({ ...cell }))
   );
   const cars = state.cars.map((c) => ({ ...c, path: c.path }));
-  const stats = { ...state.stats };
+  const stats = { ...state.stats, greenCorridorCount: 0 };
   let accidents = [...state.accidents];
 
   const tick = state.tick + 1;
@@ -302,6 +303,7 @@ export function simulateTick(state) {
       car.col     = next.col;
       car.waiting = false;
       nextOccupied.add(nextKey);
+      stats.greenCorridorCount = (stats.greenCorridorCount || 0) + 1;
     } else {
       car.waiting = true;
       car.waitTime++;
