@@ -2,7 +2,15 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import TrafficGrid from './TrafficGrid';
 import StatsPanel from './StatsPanel';
 import CarChart from './CarChart';
-import { createSimState, simulateTick, addAccident } from './simulation';
+import { createSimState, simulateTick, addAccident, clearAccidents, GRID_SIZE, TOTAL_CELLS } from './simulation';
+
+// Scenario constants — Phase A: standard control, accidents at tick 50.
+// Phase B: webster takes over at tick 150, congestion clears by tick 300.
+const SCENARIO_ACCIDENT_TICK = 50;
+const SCENARIO_PHASE_B_TICK = 150;
+const SCENARIO_END_TICK = 300;
+const SCENARIO_SPAWN_RATE = 6;
+const SCENARIO_ACCIDENTS = [[4, 4], [5, 6]];
 import CAMCanvas from './components/CAMCanvas.jsx';
 import { createCAMGrid, seedVehicles, syncAccidents } from './cam/grid.js';
 import { camStep, applyWaveMode, getCAMMetrics } from './cam/simulator.js';
@@ -24,9 +32,35 @@ function App() {
   const [selInter, setSelInter]     = useState(null);
   const camIntervalRef              = useRef(null);
 
+  // Scenario state: null | 'A' | 'B' | 'done'. Use a ref alongside the
+  // useState so the tick callback can read the current phase without
+  // taking a dependency that would tear down the setInterval.
+  const [scenarioPhase, setScenarioPhase] = useState(null);
+  const scenarioPhaseRef = useRef(null);
+
   const tick = useCallback(() => {
     setState((prev) => {
-      const next = simulateTick(prev);
+      let next = simulateTick(prev);
+
+      // Scenario transitions fire at exact tick boundaries.
+      const phase = scenarioPhaseRef.current;
+      if (phase === 'A') {
+        if (next.tick === SCENARIO_ACCIDENT_TICK) {
+          for (const [r, c] of SCENARIO_ACCIDENTS) {
+            next = addAccident(next, r, c);
+          }
+        } else if (next.tick === SCENARIO_PHASE_B_TICK) {
+          next = clearAccidents(next);
+          next = { ...next, controlMode: 'webster' };
+          scenarioPhaseRef.current = 'B';
+          setScenarioPhase('B');
+        }
+      } else if (phase === 'B' && next.tick >= SCENARIO_END_TICK) {
+        scenarioPhaseRef.current = 'done';
+        setScenarioPhase('done');
+        setRunning(false);
+      }
+
       const moving = next.cars.filter((c) => !c.waiting).length;
       const waiting = next.cars.filter((c) => c.waiting).length;
       const greenCorridor = next.stats.greenCorridorCount;
@@ -74,10 +108,24 @@ function App() {
     setRunning(false);
     setState(createSimState());
     setHistory([]);
+    scenarioPhaseRef.current = null;
+    setScenarioPhase(null);
   };
 
   const handleSpawnRate = (val) => {
     setState((prev) => ({ ...prev, spawnRate: Number(val) }));
+  };
+
+  const handleRunScenario = () => {
+    setRunning(false);
+    const fresh = createSimState();
+    fresh.spawnRate = SCENARIO_SPAWN_RATE;
+    fresh.controlMode = 'standard';
+    setState(fresh);
+    setHistory([]);
+    scenarioPhaseRef.current = 'A';
+    setScenarioPhase('A');
+    setRunning(true);
   };
 
   return (
@@ -89,6 +137,10 @@ function App() {
           перестраивают маршрут, а ближайшие светофоры корректируют фазы.
         </p>
       </header>
+
+      {scenarioPhase && (
+        <ScenarioBanner phase={scenarioPhase} tick={state.tick} />
+      )}
 
       <div style={styles.controls}>
         <button
@@ -105,6 +157,14 @@ function App() {
         </button>
         <button onClick={handleReset} style={{ ...styles.btn, background: '#666' }}>
           Сброс
+        </button>
+
+        <button
+          onClick={handleRunScenario}
+          style={{ ...styles.btn, background: '#9933cc' }}
+          title="Phase A: standard control with accidents → Phase B: webster clears congestion"
+        >
+          ▶ Сценарий
         </button>
 
         <div style={styles.sliderGroup}>
@@ -128,9 +188,24 @@ function App() {
           <input
             type="range"
             min={1}
-            max={20}
+            max={200}
             value={state.spawnRate}
             onChange={(e) => handleSpawnRate(e.target.value)}
+            style={styles.slider}
+          />
+        </div>
+
+        <div style={styles.sliderGroup}>
+          <label style={styles.sliderLabel}>
+            Макс. машин: {state.maxCars}
+          </label>
+          <input
+            type="range"
+            min={10}
+            max={TOTAL_CELLS}
+            step={50}
+            value={state.maxCars}
+            onChange={(e) => setState((prev) => ({ ...prev, maxCars: Number(e.target.value) }))}
             style={styles.slider}
           />
         </div>
@@ -142,7 +217,7 @@ function App() {
               <button
                 key={id}
                 onClick={() => setViewMode(id)}
-                style={{ ...styles.modeBtn, background: viewMode === id ? '#3366ff' : '#2a2a4a', borderColor: viewMode === id ? '#5588ff' : '#3a3a5a' }}
+                style={{ ...styles.modeBtn, background: viewMode === id ? '#3366ff' : '#e8eaed', color: viewMode === id ? '#fff' : '#333', borderColor: viewMode === id ? '#5588ff' : '#c5c8cd' }}
               >{label}</button>
             ))}
           </div>
@@ -159,7 +234,7 @@ function App() {
             </div>
             <button
               onClick={() => { const next = !waveMode; setWaveMode(next); setCamGrid(prev => { applyWaveMode(prev, next); return { ...prev }; }); }}
-              style={{ ...styles.modeBtn, background: waveMode ? '#1D9E75' : '#2a2a4a', borderColor: waveMode ? '#1D9E75' : '#3a3a5a' }}
+              style={{ ...styles.modeBtn, background: waveMode ? '#1D9E75' : '#e8eaed', color: waveMode ? '#fff' : '#333', borderColor: waveMode ? '#1D9E75' : '#c5c8cd' }}
             >~ Волна</button>
           </>
         )}
@@ -177,8 +252,9 @@ function App() {
                 onClick={() => setState((prev) => ({ ...prev, controlMode: id }))}
                 style={{
                   ...styles.modeBtn,
-                  background: state.controlMode === id ? '#3366ff' : '#2a2a4a',
-                  borderColor: state.controlMode === id ? '#5588ff' : '#3a3a5a',
+                  background: state.controlMode === id ? '#3366ff' : '#e8eaed',
+                  color: state.controlMode === id ? '#fff' : '#333',
+                  borderColor: state.controlMode === id ? '#5588ff' : '#c5c8cd',
                 }}
               >
                 {label}
@@ -189,6 +265,11 @@ function App() {
       </div>
 
       <div style={styles.main}>
+        <div style={styles.bottomPanel}>
+          <StatsPanel state={state} scenarioPhase={scenarioPhase} />
+          <CarChart history={history} />
+        </div>
+
         <div style={styles.gridContainer}>
           {viewMode === 'svg'
             ? <TrafficGrid state={state} onCellClick={handleCellClick} speed={speed} />
@@ -222,11 +303,57 @@ function App() {
             </div>
           )}
         </div>
+      </div>
+    </div>
+  );
+}
 
-        <div style={styles.bottomPanel}>
-          <StatsPanel state={state} />
-          <CarChart history={history} />
-        </div>
+function ScenarioBanner({ phase, tick }) {
+  const labels = {
+    A: '⚠ Фаза А: Стандартное управление (нарастание заторов...)',
+    B: '✓ Фаза B: Вебстер активен (разгрузка...)',
+    done: '✓ Сценарий завершён',
+  };
+  const colors = {
+    A: '#e8542f',
+    B: '#1f9d63',
+    done: '#5566cc',
+  };
+  const cappedTick = Math.min(tick, SCENARIO_END_TICK);
+  const pct = (cappedTick / SCENARIO_END_TICK) * 100;
+  const phaseSplit = (SCENARIO_PHASE_B_TICK / SCENARIO_END_TICK) * 100;
+  return (
+    <div style={{
+      background: colors[phase],
+      color: '#fff',
+      padding: '12px 16px',
+      borderRadius: 8,
+      marginBottom: 12,
+      display: 'flex',
+      flexDirection: 'column',
+      gap: 8,
+    }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <span style={{ fontWeight: 600, fontSize: 14 }}>{labels[phase]}</span>
+        <span style={{ fontFamily: 'monospace', fontSize: 13 }}>{cappedTick} / {SCENARIO_END_TICK}</span>
+      </div>
+      <div style={{ position: 'relative', width: '100%', height: 8, background: 'rgba(255,255,255,0.25)', borderRadius: 4 }}>
+        <div style={{
+          width: `${pct}%`,
+          height: '100%',
+          background: '#fff',
+          borderRadius: 4,
+          transition: 'width 0.2s linear',
+        }} />
+        {/* Phase A→B boundary tick */}
+        <div style={{
+          position: 'absolute',
+          left: `${phaseSplit}%`,
+          top: -2,
+          width: 1,
+          height: 12,
+          background: 'rgba(255,255,255,0.7)',
+        }} />
       </div>
     </div>
   );
@@ -243,7 +370,7 @@ function LegendItem({ color, label }) {
           background: color,
         }}
       />
-      <span style={{ fontSize: 12, color: '#aaa' }}>{label}</span>
+      <span style={{ fontSize: 12, color: '#555' }}>{label}</span>
     </div>
   );
 }
@@ -251,8 +378,8 @@ function LegendItem({ color, label }) {
 const styles = {
   app: {
     minHeight: '100vh',
-    background: '#0d0d1a',
-    color: '#eee',
+    background: '#f5f5f7',
+    color: '#1a1a1a',
     fontFamily:
       '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
     padding: '20px 24px',
@@ -272,7 +399,7 @@ const styles = {
   subtitle: {
     margin: '6px 0 0',
     fontSize: 13,
-    color: '#888',
+    color: '#666',
   },
   controls: {
     display: 'flex',
@@ -282,9 +409,9 @@ const styles = {
     flexWrap: 'wrap',
     marginBottom: 16,
     padding: '12px 16px',
-    background: '#16162a',
+    background: '#ffffff',
     borderRadius: 8,
-    border: '1px solid #2a2a4a',
+    border: '1px solid #dde1e7',
   },
   btn: {
     padding: '8px 18px',
@@ -305,7 +432,7 @@ const styles = {
   },
   sliderLabel: {
     fontSize: 11,
-    color: '#888',
+    color: '#666',
     fontFamily: 'monospace',
   },
   slider: {
@@ -314,21 +441,22 @@ const styles = {
   },
   main: {
     display: 'flex',
-    flexDirection: 'column',
+    flexDirection: 'row',
     gap: 16,
+    alignItems: 'flex-start',
   },
   gridContainer: {
     display: 'flex',
     flexDirection: 'column',
     gap: 8,
-    width: '100%',
+    flex: 3,
   },
   bottomPanel: {
     display: 'flex',
+    flexDirection: 'column',
     gap: 20,
-    flexWrap: 'wrap',
-    alignItems: 'flex-start',
-    justifyContent: 'center',
+    flex: 1,
+    minWidth: 0,
   },
   legend: {
     display: 'flex',
@@ -347,7 +475,7 @@ const styles = {
     padding: '5px 10px',
     border: '1px solid',
     borderRadius: 5,
-    color: '#fff',
+    color: '#333',
     fontSize: 12,
     fontWeight: 600,
     cursor: 'pointer',

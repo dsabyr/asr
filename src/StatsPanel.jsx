@@ -1,5 +1,12 @@
-function StatsPanel({ state }) {
+function StatsPanel({ state, scenarioPhase }) {
   const { stats, accidents, cars, tick } = state;
+
+  // Highlight avgWait based on scenario phase:
+  // Phase A → red (congestion building), Phase B → green (clearing).
+  const avgWaitColor =
+    scenarioPhase === 'A' ? '#ff3333'
+    : scenarioPhase === 'B' ? '#00cc66'
+    : '#ff6666';
 
   const avgWait =
     stats.completedTrips > 0
@@ -31,7 +38,7 @@ function StatsPanel({ state }) {
         <StatCard label="На сетке" value={stats.carsInGrid} color="#ffaa00" />
         <StatCard label="Едут" value={currentMoving} color="#00ccff" />
         <StatCard label="Стоят" value={currentWaiting} color="#ff8844" />
-        <StatCard label="Среднее ожидание" value={`${avgWait} т`} color="#ff6666" />
+        <StatCard label="Среднее ожидание" value={`${avgWait} т`} color={avgWaitColor} />
         <StatCard label="Среднее время пути" value={`${avgTravel} т`} color="#aa88ff" />
         <StatCard
           label="Поток"
@@ -74,18 +81,18 @@ function StatCard({ label, value, color }) {
 
 const styles = {
   panel: {
-    background: '#16162a',
+    background: '#ffffff',
     borderRadius: 8,
     padding: 16,
     minWidth: 280,
-    border: '1px solid #2a2a4a',
+    border: '1px solid #dde1e7',
   },
   title: {
     margin: '0 0 12px',
-    color: '#ddd',
+    color: '#1a1a1a',
     fontSize: 16,
     fontWeight: 600,
-    borderBottom: '1px solid #2a2a4a',
+    borderBottom: '1px solid #dde1e7',
     paddingBottom: 8,
   },
   grid: {
@@ -94,7 +101,7 @@ const styles = {
     gap: 8,
   },
   card: {
-    background: '#1e1e38',
+    background: '#f0f2f5',
     borderRadius: 6,
     padding: '10px 12px',
     textAlign: 'center',
@@ -106,7 +113,7 @@ const styles = {
   },
   label: {
     fontSize: 11,
-    color: '#888',
+    color: '#666',
     marginTop: 2,
     textTransform: 'uppercase',
     letterSpacing: 0.5,

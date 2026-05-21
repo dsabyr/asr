@@ -3,9 +3,9 @@ import { CELL_PX, INTER_PX, SEG_PX, ROAD_PX, WORLD_STEP,
 import { getSeg } from './grid.js';
 
 function vColor(v) {
-  if (v === 0) return '#3B8BD4';
-  if (v <= 2)  return '#1D9E75';
-  return '#EF9F27';
+  if (v === 0) return '#4DA6E8';   // stopped — muted blue
+  if (v <= 2)  return '#5CB85C';   // slow — green
+  return '#F0A500';                 // moving — amber
 }
 
 function iOrig(ix, iy) {
@@ -14,29 +14,28 @@ function iOrig(ix, iy) {
 
 export function renderCAMGrid(canvas, camGrid, zoom, panX, panY, selIx, selIy) {
   const ctx  = canvas.getContext('2d');
-  const dark = window.matchMedia('(prefers-color-scheme: dark)').matches;
 
   const colors = {
-    bg:        dark ? '#2c2c2a' : '#e6e3dc',
-    road:      dark ? '#3a3830' : '#c8c5bc',
-    divider:   dark ? '#2c2c2a' : '#b0ada4',
-    emptyFill: dark ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.05)',
-    emptyStr:  dark ? 'rgba(255,255,255,0.10)' : 'rgba(0,0,0,0.10)',
-    pocket:    dark ? 'rgba(212,83,126,0.18)' : 'rgba(212,83,126,0.15)',
-    pocketStr: 'rgba(212,83,126,0.30)',
-    interNS:   dark ? 'rgba(29,158,117,0.20)' : 'rgba(29,158,117,0.15)',
-    interEW:   dark ? 'rgba(56,138,221,0.20)' : 'rgba(56,138,221,0.14)',
-    interYel:  dark ? 'rgba(239,159,39,0.20)' : 'rgba(239,159,39,0.14)',
-    interSel:  'rgba(239,159,39,0.28)',
-    strNS:     '#1D9E75',
-    strEW:     '#378ADD',
-    strYel:    '#EF9F27',
-    strSel:    '#EF9F27',
-    incident:  '#E24B4A',
-    pocketCar: '#D4537E',
-    gridLine:  dark ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.07)',
-    divLine:   dark ? 'rgba(255,255,255,0.16)' : 'rgba(0,0,0,0.16)',
-    label:     dark ? 'rgba(255,255,255,0.70)' : 'rgba(0,0,0,0.50)',
+    bg:        '#EDE8DC',   // warm beige land
+    road:      '#FFFFFF',   // white road surface
+    divider:   '#C8C3B8',   // warm grey center line
+    emptyFill: 'rgba(180,170,155,0.18)',
+    emptyStr:  'rgba(150,140,125,0.25)',
+    pocket:    'rgba(212,83,126,0.13)',
+    pocketStr: 'rgba(212,83,126,0.28)',
+    interNS:   'rgba(29,158,117,0.18)',
+    interEW:   'rgba(56,138,221,0.16)',
+    interYel:  'rgba(239,159,39,0.16)',
+    interSel:  'rgba(239,159,39,0.32)',
+    strNS:     '#1A9268',
+    strEW:     '#2E7FC0',
+    strYel:    '#D4890A',
+    strSel:    '#D4890A',
+    incident:  '#D63B3B',
+    pocketCar: '#C0456E',
+    gridLine:  'rgba(150,140,125,0.20)',
+    divLine:   'rgba(120,110,95,0.30)',
+    label:     'rgba(60,50,35,0.55)',
   };
 
   ctx.clearRect(0, 0, canvas.width, canvas.height);

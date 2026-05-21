@@ -122,24 +122,24 @@ function LegendDot({ color, label }) {
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
       <div style={{ width: 10, height: 3, background: color, borderRadius: 2 }} />
-      <span style={{ fontSize: 11, color: '#aaa' }}>{label}</span>
+      <span style={{ fontSize: 11, color: '#555' }}>{label}</span>
     </div>
   );
 }
 
 const styles = {
   panel: {
-    background: '#16162a',
+    background: '#ffffff',
     borderRadius: 8,
     padding: '12px 12px 8px',
-    border: '1px solid #2a2a4a',
+    border: '1px solid #dde1e7',
   },
   title: {
     fontSize: 14,
     fontWeight: 600,
-    color: '#ddd',
+    color: '#1a1a1a',
     marginBottom: 6,
-    borderBottom: '1px solid #2a2a4a',
+    borderBottom: '1px solid #dde1e7',
     paddingBottom: 6,
   },
   legend: {
