@@ -15,8 +15,6 @@ import CAMCanvas from './components/CAMCanvas.jsx';
 import { createCAMGrid, seedVehicles, syncAccidents } from './cam/grid.js';
 import { camStep, applyWaveMode, getCAMMetrics } from './cam/simulator.js';
 
-const HISTORY_MAX = 120;
-
 function App() {
   const [state, setState] = useState(createSimState);
   const [running, setRunning] = useState(false);
@@ -64,10 +62,7 @@ function App() {
       const moving = next.cars.filter((c) => !c.waiting).length;
       const waiting = next.cars.filter((c) => c.waiting).length;
       const greenCorridor = next.stats.greenCorridorCount;
-      setHistory((h) => {
-        const entry = { tick: next.tick, moving, waiting, greenCorridor };
-        return h.length >= HISTORY_MAX ? [...h.slice(1), entry] : [...h, entry];
-      });
+      setHistory((h) => [...h, { tick: next.tick, moving, waiting, greenCorridor }]);
       return next;
     });
   }, []);
@@ -246,6 +241,7 @@ function App() {
               { id: 'standard', label: 'Стандарт' },
               { id: 'webster', label: 'Вебстер' },
               { id: 'adaptive', label: 'Адаптив' },
+              { id: 'maxpressure', label: 'Давление' },
             ].map(({ id, label }) => (
               <button
                 key={id}

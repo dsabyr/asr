@@ -24,8 +24,21 @@ const DIRS_4 = [
 const DEFAULT_PHASE = 12;
 const MIN_PHASE = 4;
 const MAX_PHASE = 30;
-const SAT_FLOW = 3;
+const SAT_FLOW = 30;
 const LOST_TIME = 4;
+const CLEARANCE_TICKS = 2;
+const EMA_ALPHA = 0.2;
+// Above this fraction of grid cells occupied, spawn probability decays
+// linearly to zero. Without this the slider can ask for more demand than
+// the grid can physically discharge and the system gridlocks regardless of
+// signal policy.
+const THROTTLE_DENSITY = 0.25;
+// Cars recompute their path every REROUTE_INTERVAL ticks using current
+// segment occupancy as edge weight, so demand spreads across the network
+// instead of piling on whatever shortest path A* picked at spawn.
+const REROUTE_INTERVAL = 40;
+const LOAD_PENALTY = 20;
+const SEG_CAPACITY = LANES * SEG_CELLS;
 
 let nextCarId = 1;
 
@@ -73,6 +86,10 @@ export function createGrid() {
         phaseDuration: DEFAULT_PHASE,
         hasAccident: false,
         accidentTimer: 0,
+        qNS_ema: 0,
+        qEW_ema: 0,
+        clearing: false,
+        clearanceTimer: 0,
       });
     }
     intersections.push(row);
@@ -93,6 +110,8 @@ export function createSimState() {
       completedTrips: 0,
       carsInGrid: 0,
       greenCorridorCount: 0,
+      density: 0,
+      spawnThrottled: false,
     },
     accidents: [],
     spawnRate: 3,
@@ -190,7 +209,20 @@ function heuristic(p, destIr, destIc) {
     (Math.abs(p.toIr - destIr) + Math.abs(p.toIc - destIc)) * HOP_COST;
 }
 
-export function findPath(grid, start, end) {
+// Edge cost when stepping into position `n`. Without `segmentLoad`, uniform 1
+// (preserves old behavior for callers that don't pass it). With a load map,
+// stepping into a segment cell costs more proportionally to how full that
+// segment is — quadratic so heavy congestion is strongly avoided but light
+// congestion barely matters. Intersection-cell entries always cost 1 (we
+// don't want to penalize crossings, only choice of segment).
+function edgeCost(n, segmentLoad) {
+  if (!segmentLoad || n.kind === 'i') return 1;
+  const segKey = `${n.fromIr},${n.fromIc},${n.toIr},${n.toIc}`;
+  const load = (segmentLoad[segKey] || 0) / SEG_CAPACITY;
+  return 1 + LOAD_PENALTY * load * load;
+}
+
+export function findPath(grid, start, end, segmentLoad) {
   const startKey = posKey(start);
   const endKey = posKey(end);
   if (startKey === endKey) return [start];
@@ -228,7 +260,7 @@ export function findPath(grid, start, end) {
       const nk = posKey(n);
       if (closed.has(nk)) continue;
       if (isPosBlocked(grid, n)) continue;
-      const tentativeG = curG + 1;
+      const tentativeG = curG + edgeCost(n, segmentLoad);
       const prevG = gScore.get(nk);
       if (prevG === undefined || tentativeG < prevG) {
         gScore.set(nk, tentativeG);
@@ -320,6 +352,9 @@ function spawnCar(state, occupied) {
       waiting: false,
       waitTime: 0,
       travelTime: 0,
+      // Stagger the first reroute across [0, REROUTE_INTERVAL) so the cost
+      // of rerouting is spread over ticks instead of spiking every 40th.
+      nextRerouteTick: state.tick + Math.floor(Math.random() * REROUTE_INTERVAL),
     };
   };
 
@@ -349,8 +384,44 @@ function spawnCar(state, occupied) {
 
 function canPass(intersection, direction) {
   if (intersection.hasAccident) return false;
+  if (intersection.clearing) return false;
   const isNS = direction === 'north' || direction === 'south';
   return (isNS && intersection.phase === 'ns') || (!isNS && intersection.phase === 'ew');
+}
+
+function hasAccidentNeighbor(grid, r, c) {
+  for (const { dr, dc } of DIRS_4) {
+    const nr = r + dr, nc = c + dc;
+    if (nr < 0 || nr >= GRID_SIZE || nc < 0 || nc >= GRID_SIZE) continue;
+    if (grid[nr][nc].hasAccident) return true;
+  }
+  return false;
+}
+
+// Webster cycle/green computation. Returns `phaseDuration` to use for the
+// upcoming green phase `nextPhase`. Reads smoothed approach demand from the
+// intersection's EMA fields so it reflects sustained queues, not a single
+// noisy tick at the moment of phase flip.
+function websterDuration(inter, nextPhase) {
+  const yNS = Math.min(inter.qNS_ema / SAT_FLOW, 0.45);
+  const yEW = Math.min(inter.qEW_ema / SAT_FLOW, 0.45);
+  const Y   = Math.min(yNS + yEW, 0.9);
+  const C   = Math.max(MIN_PHASE * 2, Math.min(MAX_PHASE * 2,
+                Math.round((1.5 * LOST_TIME + 5) / (1 - Y))));
+  const green = C - LOST_TIME;
+  const total = yNS + yEW || 1;
+  const nsG = Math.max(MIN_PHASE, Math.round(green * yNS / total));
+  const ewG = Math.max(MIN_PHASE, Math.round(green * yEW / total));
+  return nextPhase === 'ns' ? nsG : ewG;
+}
+
+function adaptiveDuration(inter, nextPhase) {
+  const inQ  = nextPhase === 'ns' ? inter.qNS_ema : inter.qEW_ema;
+  const outQ = nextPhase === 'ns' ? inter.qEW_ema : inter.qNS_ema;
+  const total = inQ + outQ || 1;
+  const ratio = inQ / total;
+  return Math.max(MIN_PHASE,
+    Math.min(MAX_PHASE, Math.round(MIN_PHASE + ratio * (MAX_PHASE - MIN_PHASE))));
 }
 
 export function simulateTick(state) {
@@ -360,21 +431,50 @@ export function simulateTick(state) {
   let accidents = [...state.accidents];
   const tick = state.tick + 1;
 
-  // NS/EW waiting queues (only cars held at an intersection, about to leave it).
-  const nsQueue = {};
-  const ewQueue = {};
+  // Approach demand: every car on a segment whose downstream intersection is
+  // (toIr, toIc) contributes to that intersection's NS or EW queue. This is
+  // the signal Webster/adaptive should be sizing for — not just cars already
+  // at the stop line, which was the old definition and saw queues of 0–2.
+  // Stopline counts (cars currently held at an intersection waiting to leave)
+  // are tracked separately and used only for adaptive's early-cut decision.
+  const nsApproach = {};
+  const ewApproach = {};
+  const nsStopline = {};
+  const ewStopline = {};
+  // Downstream loads: cars on segments *leaving* (r,c) in each direction.
+  // Max-pressure picks the phase that maximizes (inbound − outbound) demand,
+  // so we need both sides of the difference.
+  const nsDownstream = {};
+  const ewDownstream = {};
   if (state.controlMode !== 'standard') {
     for (const car of state.cars) {
-      if (!car.waiting) continue;
-      const cur = car.pos;
-      if (cur.kind !== 'i') continue;
-      if (car.pathIndex >= car.path.length - 1) continue;
-      const next = car.path[car.pathIndex + 1];
-      if (next.kind !== 's') continue;
-      const dir = dirOfSeg(cur.ir, cur.ic, next.toIr, next.toIc);
-      const key = `${cur.ir}-${cur.ic}`;
-      if (dir === 'north' || dir === 'south') nsQueue[key] = (nsQueue[key] || 0) + 1;
-      else ewQueue[key] = (ewQueue[key] || 0) + 1;
+      const p = car.pos;
+      if (p.kind === 's') {
+        const inKey = `${p.toIr}-${p.toIc}`;
+        const outKey = `${p.fromIr}-${p.fromIc}`;
+        const dir = dirOfSeg(p.fromIr, p.fromIc, p.toIr, p.toIc);
+        if (dir === 'north' || dir === 'south') {
+          nsApproach[inKey] = (nsApproach[inKey] || 0) + 1;
+          nsDownstream[outKey] = (nsDownstream[outKey] || 0) + 1;
+        } else {
+          ewApproach[inKey] = (ewApproach[inKey] || 0) + 1;
+          ewDownstream[outKey] = (ewDownstream[outKey] || 0) + 1;
+        }
+      } else {
+        if (!car.waiting) continue;
+        if (car.pathIndex >= car.path.length - 1) continue;
+        const next = car.path[car.pathIndex + 1];
+        if (next.kind !== 's') continue;
+        const dir = dirOfSeg(p.ir, p.ic, next.toIr, next.toIc);
+        const key = `${p.ir}-${p.ic}`;
+        if (dir === 'north' || dir === 'south') {
+          nsApproach[key] = (nsApproach[key] || 0) + 1;
+          nsStopline[key] = (nsStopline[key] || 0) + 1;
+        } else {
+          ewApproach[key] = (ewApproach[key] || 0) + 1;
+          ewStopline[key] = (ewStopline[key] || 0) + 1;
+        }
+      }
     }
   }
 
@@ -389,47 +489,69 @@ export function simulateTick(state) {
           inter.hasAccident = false;
           inter.accidentTimer = 0;
           inter.phaseDuration = DEFAULT_PHASE;
+          inter.clearing = false;
+          inter.clearanceTimer = 0;
           accidents = accidents.filter((a) => !(a.row === r && a.col === c));
         }
         continue;
       }
 
+      const key = `${r}-${c}`;
+      if (state.controlMode !== 'standard') {
+        inter.qNS_ema = EMA_ALPHA * (nsApproach[key] || 0) + (1 - EMA_ALPHA) * inter.qNS_ema;
+        inter.qEW_ema = EMA_ALPHA * (ewApproach[key] || 0) + (1 - EMA_ALPHA) * inter.qEW_ema;
+      }
+
+      // All-red clearance interval. When phaseTimer overflows we set
+      // clearing=true (below); during clearance no direction can pass, giving
+      // intersection cells time to drain before the cross-direction enters.
+      if (inter.clearing) {
+        inter.clearanceTimer++;
+        if (inter.clearanceTimer >= CLEARANCE_TICKS) {
+          inter.clearing = false;
+          inter.clearanceTimer = 0;
+          inter.phase = inter.phase === 'ns' ? 'ew' : 'ns';
+          inter.phaseTimer = 0;
+
+          if (state.controlMode === 'webster' && !hasAccidentNeighbor(grid, r, c)) {
+            inter.phaseDuration = websterDuration(inter, inter.phase);
+          } else if (state.controlMode === 'adaptive') {
+            inter.phaseDuration = adaptiveDuration(inter, inter.phase);
+          }
+          // maxpressure: phase length is decided by pressure, not a fixed
+          // duration — leave phaseDuration untouched.
+        }
+        continue;
+      }
+
+      // Max-pressure: switch as soon as the alternative direction has strictly
+      // more queue-pressure (inbound − downstream), subject to MIN_PHASE.
+      // Provably stable for any feasible demand, so it should keep working
+      // where Webster collapses.
+      if (state.controlMode === 'maxpressure' && inter.phaseTimer >= MIN_PHASE) {
+        const pNS = (nsApproach[key] || 0) - (nsDownstream[key] || 0);
+        const pEW = (ewApproach[key] || 0) - (ewDownstream[key] || 0);
+        const curP = inter.phase === 'ns' ? pNS : pEW;
+        const altP = inter.phase === 'ns' ? pEW : pNS;
+        if (altP > curP) {
+          inter.clearing = true;
+          inter.clearanceTimer = 0;
+          continue;
+        }
+      }
+
       if (state.controlMode === 'adaptive' && inter.phaseTimer >= MIN_PHASE) {
-        const key = `${r}-${c}`;
-        const greenQ = inter.phase === 'ns' ? (nsQueue[key] || 0) : (ewQueue[key] || 0);
-        const redQ   = inter.phase === 'ns' ? (ewQueue[key] || 0) : (nsQueue[key] || 0);
+        const greenQ = inter.phase === 'ns' ? (nsStopline[key] || 0) : (ewStopline[key] || 0);
+        const redQ   = inter.phase === 'ns' ? (ewStopline[key] || 0) : (nsStopline[key] || 0);
         if (greenQ === 0 && redQ > 0) {
           inter.phaseTimer = inter.phaseDuration - 1;
         }
       }
 
       inter.phaseTimer++;
-      if (inter.phaseTimer >= inter.phaseDuration) {
-        inter.phaseTimer = 0;
-        inter.phase = inter.phase === 'ns' ? 'ew' : 'ns';
-
-        const key = `${r}-${c}`;
-        if (state.controlMode === 'webster') {
-          const qNS = nsQueue[key] || 0;
-          const qEW = ewQueue[key] || 0;
-          const yNS = Math.min(qNS / SAT_FLOW, 0.45);
-          const yEW = Math.min(qEW / SAT_FLOW, 0.45);
-          const Y   = Math.min(yNS + yEW, 0.9);
-          const C   = Math.max(MIN_PHASE * 2, Math.min(MAX_PHASE * 2,
-                        Math.round((1.5 * LOST_TIME + 5) / (1 - Y))));
-          const green = C - LOST_TIME;
-          const total = yNS + yEW || 1;
-          const nsG = Math.max(MIN_PHASE, Math.round(green * yNS / total));
-          const ewG = Math.max(MIN_PHASE, Math.round(green * yEW / total));
-          inter.phaseDuration = inter.phase === 'ns' ? nsG : ewG;
-        } else if (state.controlMode === 'adaptive') {
-          const inQ  = inter.phase === 'ns' ? (nsQueue[key] || 0) : (ewQueue[key] || 0);
-          const outQ = inter.phase === 'ns' ? (ewQueue[key] || 0) : (nsQueue[key] || 0);
-          const total = inQ + outQ || 1;
-          const ratio = inQ / total;
-          inter.phaseDuration = Math.max(MIN_PHASE,
-            Math.min(MAX_PHASE, Math.round(MIN_PHASE + ratio * (MAX_PHASE - MIN_PHASE))));
-        }
+      if (state.controlMode !== 'maxpressure' && inter.phaseTimer >= inter.phaseDuration) {
+        inter.clearing = true;
+        inter.clearanceTimer = 0;
       }
     }
   }
@@ -439,6 +561,16 @@ export function simulateTick(state) {
   // One car per cell. Pre-seed with every occupied cell; moving cars delete
   // their old cell so followers can advance into the vacated spot this tick.
   const nextOccupied = new Set(cars.map((c) => posKey(c.pos)));
+
+  // Snapshot of segment occupancy at the start of this tick. Used as edge
+  // weight by periodic reroutes so cars choose lightly-loaded segments.
+  const segmentLoad = {};
+  for (const car of cars) {
+    if (car.pos.kind === 's') {
+      const k = `${car.pos.fromIr},${car.pos.fromIc},${car.pos.toIr},${car.pos.toIc}`;
+      segmentLoad[k] = (segmentLoad[k] || 0) + 1;
+    }
+  }
 
   const order = [...Array(cars.length).keys()].sort(
     (a, b) => cars[b].pathIndex - cars[a].pathIndex
@@ -465,6 +597,19 @@ export function simulateTick(state) {
       continue;
     }
 
+    // Periodic congestion-aware reroute. Runs before computing next-cell so
+    // the move logic below uses the updated path. Cheap when the current
+    // path is still best (A* returns the same prefix).
+    if (tick >= (car.nextRerouteTick ?? Infinity)) {
+      const dest = ipos(car.destIr, car.destIc);
+      const newPath = findPath(grid, car.pos, dest, segmentLoad);
+      if (newPath && newPath.length >= 2) {
+        car.path = newPath;
+        car.pathIndex = 0;
+      }
+      car.nextRerouteTick = tick + REROUTE_INTERVAL;
+    }
+
     const current = car.path[car.pathIndex];
     const next    = car.path[car.pathIndex + 1];
     const curKey  = posKey(current);
@@ -473,7 +618,7 @@ export function simulateTick(state) {
     // Reroute when the next position is an intersection blocked by accident.
     if (next.kind === 'i' && grid[next.ir][next.ic].hasAccident) {
       const dest = ipos(car.destIr, car.destIc);
-      const newPath = findPath(grid, current, dest);
+      const newPath = findPath(grid, current, dest, segmentLoad);
       if (newPath && newPath.length >= 2) {
         cars[i] = { ...car, path: newPath, pathIndex: 0, pos: current, waiting: true };
         cars[i].waitTime++;
@@ -519,9 +664,17 @@ export function simulateTick(state) {
   };
 
   // --- Spawn new cars ---
+  // Throttle as the grid fills: at density ≥ THROTTLE_DENSITY no new cars
+  // enter. Without this, a high spawnRate slider value floods the grid past
+  // its discharge capacity and no signal policy can recover.
+  const density = remainingCars.length / TOTAL_CELLS;
+  const throttleFactor = Math.max(0, 1 - density / THROTTLE_DENSITY);
+  newState.stats.density = density;
+  newState.stats.spawnThrottled = throttleFactor < 1;
+
   const spawnOccupied = new Set(remainingCars.map((c) => posKey(c.pos)));
   for (let i = 0; i < state.spawnRate; i++) {
-    if (Math.random() < 0.5) {
+    if (Math.random() < 0.5 * throttleFactor) {
       const car = spawnCar(newState, spawnOccupied);
       if (car) {
         spawnOccupied.add(posKey(car.pos));

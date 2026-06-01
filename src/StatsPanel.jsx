@@ -52,6 +52,11 @@ function StatsPanel({ state, scenarioPhase }) {
           color={accidents.length > 0 ? '#ff4444' : '#666'}
         />
         <StatCard label="Завершено поездок" value={stats.completedTrips} color="#88ccff" />
+        <StatCard
+          label={stats.spawnThrottled ? 'Плотность ⚠' : 'Плотность'}
+          value={`${((stats.density ?? 0) * 100).toFixed(1)}%`}
+          color={stats.spawnThrottled ? '#ff6666' : '#88aacc'}
+        />
       </div>
 
       {accidents.length > 0 && (
