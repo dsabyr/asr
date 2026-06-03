@@ -57,6 +57,11 @@ function StatsPanel({ state, scenarioPhase }) {
           value={`${((stats.density ?? 0) * 100).toFixed(1)}%`}
           color={stats.spawnThrottled ? '#ff6666' : '#88aacc'}
         />
+        <StatCard
+          label="Отказались"
+          value={stats.abandoned ?? 0}
+          color={(stats.abandoned ?? 0) > 0 ? '#cc7744' : '#666'}
+        />
       </div>
 
       {accidents.length > 0 && (

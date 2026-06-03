@@ -32,8 +32,20 @@ const interCenter = (ir, ic) => ({
   y: INTER_PX / 2 + ir * STEP_PX,
 });
 
+// Internal-cell pixel size: intersection box is INTER_PX wide and holds a
+// LANES×LANES internal grid (one cell per lane × lane), so each internal cell
+// gets INTER_PX / LANES pixels.
+const INTERNAL_CELL_PX = INTER_PX / LANES;
+
 function getPixel(p) {
   if (p.kind === 'i') return interCenter(p.ir, p.ic);
+  if (p.kind === 'x') {
+    const c = interCenter(p.ir, p.ic);
+    return {
+      x: c.x - INTER_PX / 2 + (p.ix + 0.5) * INTERNAL_CELL_PX,
+      y: c.y - INTER_PX / 2 + (p.iy + 0.5) * INTERNAL_CELL_PX,
+    };
+  }
   const dir = dirOfSeg(p.fromIr, p.fromIc, p.toIr, p.toIc);
   const from = interCenter(p.fromIr, p.fromIc);
   const f = (p.pos + 0.5) / SEG_CELLS;
@@ -57,8 +69,18 @@ function getCarAngle(car) {
   if (idx + 1 < path.length) { from = cur; to = path[idx + 1]; }
   else if (idx > 0)          { from = path[idx - 1]; to = cur; }
   else                       { return 0; }
+  // Prefer segment direction if either side is a segment.
   const seg = to.kind === 's' ? to : (from.kind === 's' ? from : null);
   if (seg) return ANGLE[dirOfSeg(seg.fromIr, seg.fromIc, seg.toIr, seg.toIc)] ?? 0;
+  // Both 'x' cells: derive from internal-coord delta.
+  if (from.kind === 'x' && to.kind === 'x') {
+    const dx = to.ix - from.ix;
+    const dy = to.iy - from.iy;
+    if (dx > 0) return 0;
+    if (dx < 0) return 180;
+    if (dy > 0) return 90;
+    if (dy < 0) return -90;
+  }
   return 0;
 }
 
@@ -89,12 +111,19 @@ function TrafficGrid({ state, onCellClick, speed = 100 }) {
     });
   };
 
+  // Aggregate waiting cars *at* an intersection (any internal cell or at the
+  // stopline of a segment about to enter). Used for the small "N" overlay
+  // that shows how many cars are queued at each junction.
   const waitingCount = {};
   for (const car of state.cars) {
     if (!car.waiting) continue;
-    if (car.pos.kind !== 'i') continue;
-    const key = `${car.pos.ir}-${car.pos.ic}`;
-    waitingCount[key] = (waitingCount[key] || 0) + 1;
+    if (car.pos.kind === 'x') {
+      const key = `${car.pos.ir}-${car.pos.ic}`;
+      waitingCount[key] = (waitingCount[key] || 0) + 1;
+    } else if (car.pos.kind === 's' && car.pos.pos === SEG_CELLS - 1) {
+      const key = `${car.pos.toIr}-${car.pos.toIc}`;
+      waitingCount[key] = (waitingCount[key] || 0) + 1;
+    }
   }
 
   // Road strips — filled with the asphalt+cell pattern. Centerline goes between

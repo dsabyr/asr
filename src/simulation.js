@@ -1,17 +1,22 @@
-// Smart Traffic Light Simulation Engine — multi-lane model
+// Smart Traffic Light Simulation Engine — multi-lane model with internal
+// intersection grid (P1).
 //
-// Each road between two adjacent intersections has 2 opposing directions × LANES
-// lanes × SEG_CELLS cells = 60 cells per pair of adjacent intersections.
-// Cars occupy single cells. Total cells = 100 intersections + 10,800 segment cells.
+// Each intersection now has an internal LANES × LANES grid of cells, so
+// non-conflicting movements (e.g. straight-through on different lanes) can
+// pass in parallel. Previously the whole intersection was a single cell and
+// per-direction discharge was capped at 1 car/tick × green_fraction.
+//
+// Each road between two adjacent intersections still has 2 opposing
+// directions × LANES lanes × SEG_CELLS cells.
 
 export const GRID_SIZE = 10;
 export const LANES = 3;
 export const SEG_CELLS = 10;
 
-// 100 intersection cells + 4 directional segments per pair × LANES × SEG_CELLS each.
-// 4 × 10 × 9 × 3 × 10 = 10,800 segment cells.
+// 900 internal intersection cells (100 intersections × LANES²)
+// + 10,800 segment cells (4 × 10 × 9 × 3 × 10).
 export const TOTAL_CELLS =
-  GRID_SIZE * GRID_SIZE +
+  GRID_SIZE * GRID_SIZE * LANES * LANES +
   4 * GRID_SIZE * (GRID_SIZE - 1) * LANES * SEG_CELLS;
 
 const DIRS_4 = [
@@ -39,20 +44,43 @@ const THROTTLE_DENSITY = 0.25;
 const REROUTE_INTERVAL = 40;
 const LOAD_PENALTY = 20;
 const SEG_CAPACITY = LANES * SEG_CELLS;
+// Cars that have been waiting for MAX_WAIT consecutive ticks despawn,
+// modeling a driver giving up / taking a detour off-grid. Without this a
+// gridlock that forms once stays forever — there's no organic decay back
+// to flow because nothing reduces demand once it's stuck.
+const MAX_WAIT = 200;
 
 let nextCarId = 1;
 
 // --- Position helpers ---
 //
-// Two position kinds:
-//   intersection cell:  { kind: 'i', ir, ic }
-//   road-segment cell:  { kind: 's', fromIr, fromIc, toIr, toIc, lane, pos }
+// Position kinds:
+//   internal intersection cell:  { kind: 'x', ir, ic, ix, iy }
+//     - ix, iy ∈ 0..LANES-1, addressing the LANES×LANES internal grid of
+//       intersection (ir, ic). Cars occupy 'x' cells one-at-a-time.
+//   road-segment cell:           { kind: 's', fromIr, fromIc, toIr, toIc, lane, pos }
 //     - fromIr/fromIc → toIr/toIc encode direction (adjacent intersections)
 //     - lane ∈ 0..LANES-1
 //     - pos  ∈ 0..SEG_CELLS-1   (0 = just past source, SEG_CELLS-1 = just before dest)
+//   logical intersection ref:    { kind: 'i', ir, ic }
+//     - NOT occupiable. Used only as a findPath endpoint meaning "any 'x'
+//       cell of this intersection." Kept for caller ergonomics so spawn
+//       destinations can still be expressed as an intersection.
+//
+// Lane↔internal mapping convention (looking at intersection from above with
+// iy=0 = north edge, iy=LANES-1 = south edge, ix=0 = west, ix=LANES-1 = east):
+//   - Northbound (entering from south): entry at (lane, LANES-1).
+//   - Southbound (entering from north): entry at (lane, 0).
+//   - Eastbound  (entering from west):  entry at (0, lane).
+//   - Westbound  (entering from east):  entry at (LANES-1, lane).
+// Exits mirror: e.g. ix=LANES-1 cells can exit east on lane=iy.
 
 function ipos(ir, ic) {
   return { kind: 'i', ir, ic };
+}
+
+function xpos(ir, ic, ix, iy) {
+  return { kind: 'x', ir, ic, ix, iy };
 }
 
 function spos(fromIr, fromIc, toIr, toIc, lane, pos) {
@@ -60,8 +88,20 @@ function spos(fromIr, fromIc, toIr, toIc, lane, pos) {
 }
 
 export function posKey(p) {
+  if (p.kind === 'x') return `x,${p.ir},${p.ic},${p.ix},${p.iy}`;
   if (p.kind === 'i') return `i,${p.ir},${p.ic}`;
   return `s,${p.fromIr},${p.fromIc},${p.toIr},${p.toIc},${p.lane},${p.pos}`;
+}
+
+// Entry 'x' cell for a car arriving from segment `seg` at pos=SEG_CELLS-1.
+function segEntryCell(seg) {
+  const dir = dirOfSeg(seg.fromIr, seg.fromIc, seg.toIr, seg.toIc);
+  switch (dir) {
+    case 'north': return xpos(seg.toIr, seg.toIc, seg.lane, LANES - 1);
+    case 'south': return xpos(seg.toIr, seg.toIc, seg.lane, 0);
+    case 'east':  return xpos(seg.toIr, seg.toIc, 0, seg.lane);
+    case 'west':  return xpos(seg.toIr, seg.toIc, LANES - 1, seg.lane);
+  }
 }
 
 export function dirOfSeg(fromIr, fromIc, toIr, toIc) {
@@ -112,6 +152,7 @@ export function createSimState() {
       greenCorridorCount: 0,
       density: 0,
       spawnThrottled: false,
+      abandoned: 0,
     },
     accidents: [],
     spawnRate: 3,
@@ -120,28 +161,40 @@ export function createSimState() {
   };
 }
 
-// --- Pathfinding (plain BFS with lane changes allowed) ---
+// --- Pathfinding (A* with lane changes and internal-intersection routing) ---
 
-// Neighbors of an intersection: pos=0 of any outgoing lane (4 dirs × LANES lanes).
+// Neighbors of an internal 'x' cell:
+//   - orthogonal step to another internal cell (cost 1)
+//   - if at an edge of the internal grid, exit onto pos=0 of outbound segment
 // Neighbors of a segment cell:
 //   - forward in same lane (pos+1)
-//   - diagonal lane change (pos+1, lane±1) — counts as one tick of movement
-//   - exit to downstream intersection when pos = SEG_CELLS-1
+//   - diagonal lane change (pos+1, lane±1) — one tick of movement
+//   - at pos=SEG_CELLS-1, enter the downstream intersection's entry 'x' cell
+//     for this segment's lane and direction
 function getNeighbors(p) {
-  if (p.kind === 'i') {
-    const out = [];
-    for (const { dr, dc } of DIRS_4) {
-      const toIr = p.ir + dr;
-      const toIc = p.ic + dc;
-      if (toIr < 0 || toIr >= GRID_SIZE || toIc < 0 || toIc >= GRID_SIZE) continue;
-      for (let lane = 0; lane < LANES; lane++) {
-        out.push(spos(p.ir, p.ic, toIr, toIc, lane, 0));
-      }
+  const out = [];
+  if (p.kind === 'x') {
+    // Internal orthogonal moves
+    if (p.ix > 0)         out.push(xpos(p.ir, p.ic, p.ix - 1, p.iy));
+    if (p.ix < LANES - 1) out.push(xpos(p.ir, p.ic, p.ix + 1, p.iy));
+    if (p.iy > 0)         out.push(xpos(p.ir, p.ic, p.ix, p.iy - 1));
+    if (p.iy < LANES - 1) out.push(xpos(p.ir, p.ic, p.ix, p.iy + 1));
+    // Exit to outbound segments (only at the matching edge cell for that direction)
+    if (p.iy === 0 && p.ir > 0) {
+      out.push(spos(p.ir, p.ic, p.ir - 1, p.ic, p.ix, 0));   // north out, lane = ix
+    }
+    if (p.iy === LANES - 1 && p.ir < GRID_SIZE - 1) {
+      out.push(spos(p.ir, p.ic, p.ir + 1, p.ic, p.ix, 0));   // south out
+    }
+    if (p.ix === 0 && p.ic > 0) {
+      out.push(spos(p.ir, p.ic, p.ir, p.ic - 1, p.iy, 0));   // west out, lane = iy
+    }
+    if (p.ix === LANES - 1 && p.ic < GRID_SIZE - 1) {
+      out.push(spos(p.ir, p.ic, p.ir, p.ic + 1, p.iy, 0));   // east out
     }
     return out;
   }
   // Segment cell
-  const out = [];
   if (p.pos < SEG_CELLS - 1) {
     out.push(spos(p.fromIr, p.fromIc, p.toIr, p.toIc, p.lane, p.pos + 1));
     if (p.lane > 0) {
@@ -151,14 +204,18 @@ function getNeighbors(p) {
       out.push(spos(p.fromIr, p.fromIc, p.toIr, p.toIc, p.lane + 1, p.pos + 1));
     }
   } else {
-    out.push(ipos(p.toIr, p.toIc));
+    out.push(segEntryCell(p));
   }
   return out;
 }
 
 function isPosBlocked(grid, p) {
-  // Only intersection cells with active accidents are blocked.
-  return p.kind === 'i' && grid[p.ir][p.ic].hasAccident;
+  // Accident blocks the whole intersection — every internal cell.
+  if (p.kind === 'x') return grid[p.ir][p.ic].hasAccident;
+  // 'i' is a logical reference, not occupiable, so isPosBlocked never gets
+  // it as a real neighbor — but keep the check defensive.
+  if (p.kind === 'i') return grid[p.ir][p.ic].hasAccident;
+  return false;
 }
 
 // --- Min-heap for A* open set ---
@@ -197,14 +254,17 @@ class MinHeap {
 }
 
 // Lower-bound cost between two intersections (Manhattan × cost-per-hop).
-// Each adjacent intersection-to-intersection move costs SEG_CELLS + 1 path steps.
+// Crossing one intersection-to-the-next requires at least SEG_CELLS forward
+// steps + 1 entry step into the destination's internal cell. Internal moves
+// inside an intersection are bounded below by 0 (entry cell might already
+// be an exit cell), so HOP_COST = SEG_CELLS + 1 remains admissible.
 const HOP_COST = SEG_CELLS + 1;
 function heuristic(p, destIr, destIc) {
-  if (p.kind === 'i') {
+  if (p.kind === 'x' || p.kind === 'i') {
     return (Math.abs(p.ir - destIr) + Math.abs(p.ic - destIc)) * HOP_COST;
   }
-  // From a segment cell: cost to reach the segment's downstream intersection,
-  // plus a Manhattan lower bound from there.
+  // Segment cell: cost to reach the segment's downstream intersection
+  // (= SEG_CELLS - pos), plus Manhattan lower bound from there.
   return (SEG_CELLS - p.pos) +
     (Math.abs(p.toIr - destIr) + Math.abs(p.toIc - destIc)) * HOP_COST;
 }
@@ -213,30 +273,48 @@ function heuristic(p, destIr, destIc) {
 // (preserves old behavior for callers that don't pass it). With a load map,
 // stepping into a segment cell costs more proportionally to how full that
 // segment is — quadratic so heavy congestion is strongly avoided but light
-// congestion barely matters. Intersection-cell entries always cost 1 (we
-// don't want to penalize crossings, only choice of segment).
+// congestion barely matters. Internal 'x' and logical 'i' entries always
+// cost 1 (we don't want to penalize crossings, only choice of segment).
 function edgeCost(n, segmentLoad) {
-  if (!segmentLoad || n.kind === 'i') return 1;
+  if (!segmentLoad || n.kind !== 's') return 1;
   const segKey = `${n.fromIr},${n.fromIc},${n.toIr},${n.toIc}`;
   const load = (segmentLoad[segKey] || 0) / SEG_CAPACITY;
   return 1 + LOAD_PENALTY * load * load;
 }
 
-export function findPath(grid, start, end, segmentLoad) {
-  const startKey = posKey(start);
-  const endKey = posKey(end);
-  if (startKey === endKey) return [start];
+// Sum of edge costs along `path` starting from index 1 (cost to step into
+// each subsequent cell). Used by reroute to compare a proposed new path
+// against the current remaining path under identical load conditions.
+function pathCost(path, segmentLoad) {
+  let cost = 0;
+  for (let i = 1; i < path.length; i++) {
+    cost += edgeCost(path[i], segmentLoad);
+  }
+  return cost;
+}
 
-  // The heuristic anchors to the destination intersection (callers always
-  // route to an edge intersection — see spawnCar / reroute paths).
-  const destIr = end.kind === 'i' ? end.ir : end.toIr;
-  const destIc = end.kind === 'i' ? end.ic : end.toIc;
+export function findPath(grid, start, end, segmentLoad) {
+  // `end` of kind 'i' is a logical "any cell of intersection (ir, ic)" goal.
+  // 'x' / 's' ends are matched exactly by posKey.
+  const destIr = end.kind === 'i' || end.kind === 'x' ? end.ir : end.toIr;
+  const destIc = end.kind === 'i' || end.kind === 'x' ? end.ic : end.toIc;
+  const endKey = end.kind === 'i' ? null : posKey(end);
+
+  const isGoal = (cur) => {
+    if (end.kind === 'i') {
+      return cur.kind === 'x' && cur.ir === destIr && cur.ic === destIc;
+    }
+    return posKey(cur) === endKey;
+  };
+
+  if (isGoal(start)) return [start];
 
   const closed = new Set();
   const parent = new Map();
   const gScore = new Map();
   const open = new MinHeap();
 
+  const startKey = posKey(start);
   gScore.set(startKey, 0);
   open.push({ pos: start, key: startKey, f: heuristic(start, destIr, destIc) });
 
@@ -245,7 +323,7 @@ export function findPath(grid, start, end, segmentLoad) {
     if (closed.has(curKey)) continue;
     closed.add(curKey);
 
-    if (curKey === endKey) {
+    if (isGoal(cur)) {
       const path = [cur];
       let prev = parent.get(curKey);
       while (prev) {
@@ -282,7 +360,8 @@ function shuffle(arr) {
   return arr;
 }
 
-function buildEdgeIntersections() {
+// Logical destination refs (intersections at the grid edge).
+function buildEdgeDestinations() {
   const edges = [];
   for (let i = 0; i < GRID_SIZE; i++) {
     edges.push(ipos(0, i));
@@ -295,11 +374,29 @@ function buildEdgeIntersections() {
   return edges;
 }
 
-function buildInteriorPositions() {
+// Spawn-start pool: actual occupiable cells inside edge intersections.
+function buildEdgeStarts() {
+  const cells = [];
+  for (const e of buildEdgeDestinations()) {
+    for (let ix = 0; ix < LANES; ix++) {
+      for (let iy = 0; iy < LANES; iy++) {
+        cells.push(xpos(e.ir, e.ic, ix, iy));
+      }
+    }
+  }
+  return cells;
+}
+
+// Spawn-start pool: every interior 'x' cell plus every segment cell.
+function buildInteriorStarts() {
   const positions = [];
   for (let r = 1; r < GRID_SIZE - 1; r++) {
     for (let c = 1; c < GRID_SIZE - 1; c++) {
-      positions.push(ipos(r, c));
+      for (let ix = 0; ix < LANES; ix++) {
+        for (let iy = 0; iy < LANES; iy++) {
+          positions.push(xpos(r, c, ix, iy));
+        }
+      }
     }
   }
   for (let fromIr = 0; fromIr < GRID_SIZE; fromIr++) {
@@ -319,25 +416,27 @@ function buildInteriorPositions() {
   return positions;
 }
 
-const EDGE_INTERSECTIONS = buildEdgeIntersections();
-const INTERIOR_POSITIONS = buildInteriorPositions();
+const EDGE_DESTINATIONS = buildEdgeDestinations();
+const EDGE_STARTS = buildEdgeStarts();
+const INTERIOR_STARTS = buildInteriorStarts();
 
 function spawnCar(state, occupied) {
   if (state.cars.length >= (state.maxCars ?? TOTAL_CELLS)) return null;
 
-  // 60% interior, 40% edge. Sample ~120 candidates from the primary pool
-  // (BFS is the expensive step; a full shuffle of 10,800+ positions would dwarf it).
+  // 60% interior, 40% edge. Sample ~60 candidates from the primary pool
+  // first (A* is the expensive step; a full shuffle of 10k+ positions would
+  // dwarf it).
   const useInterior = Math.random() < 0.6;
-  const primaryPool = useInterior ? INTERIOR_POSITIONS : EDGE_INTERSECTIONS;
-  const fallbackPool = useInterior ? EDGE_INTERSECTIONS : INTERIOR_POSITIONS;
+  const primaryPool = useInterior ? INTERIOR_STARTS : EDGE_STARTS;
+  const fallbackPool = useInterior ? EDGE_STARTS : INTERIOR_STARTS;
 
   const tryStart = (start) => {
     const startKey = posKey(start);
     if (occupied.has(startKey)) return null;
     if (isPosBlocked(state.grid, start)) return null;
 
-    const dest = EDGE_INTERSECTIONS[Math.floor(Math.random() * EDGE_INTERSECTIONS.length)];
-    if (start.kind === 'i' && start.ir === dest.ir && start.ic === dest.ic) return null;
+    const dest = EDGE_DESTINATIONS[Math.floor(Math.random() * EDGE_DESTINATIONS.length)];
+    if (start.kind === 'x' && start.ir === dest.ir && start.ic === dest.ic) return null;
 
     const path = findPath(state.grid, start, dest);
     if (!path || path.length < 2) return null;
@@ -351,6 +450,10 @@ function spawnCar(state, occupied) {
       destIc: dest.ic,
       waiting: false,
       waitTime: 0,
+      // Resets every time the car actually moves; drives the MAX_WAIT
+      // despawn check. Kept separate from `waitTime` so cumulative stats
+      // (average wait per completed trip) stay accurate.
+      consecutiveWait: 0,
       travelTime: 0,
       // Stagger the first reroute across [0, REROUTE_INTERVAL) so the cost
       // of rerouting is spread over ticks instead of spiking every 40th.
@@ -460,21 +563,16 @@ export function simulateTick(state) {
           ewApproach[inKey] = (ewApproach[inKey] || 0) + 1;
           ewDownstream[outKey] = (ewDownstream[outKey] || 0) + 1;
         }
-      } else {
-        if (!car.waiting) continue;
-        if (car.pathIndex >= car.path.length - 1) continue;
-        const next = car.path[car.pathIndex + 1];
-        if (next.kind !== 's') continue;
-        const dir = dirOfSeg(p.ir, p.ic, next.toIr, next.toIc);
-        const key = `${p.ir}-${p.ic}`;
-        if (dir === 'north' || dir === 'south') {
-          nsApproach[key] = (nsApproach[key] || 0) + 1;
-          nsStopline[key] = (nsStopline[key] || 0) + 1;
-        } else {
-          ewApproach[key] = (ewApproach[key] || 0) + 1;
-          ewStopline[key] = (ewStopline[key] || 0) + 1;
+        // Stopline = waiting cars at the very last segment cell, gated by
+        // the light from entering the intersection. The old definition
+        // (cars on the 'i' cell waiting to leave) no longer applies — cars
+        // inside the intersection are past the light.
+        if (car.waiting && p.pos === SEG_CELLS - 1) {
+          if (dir === 'north' || dir === 'south') nsStopline[inKey] = (nsStopline[inKey] || 0) + 1;
+          else ewStopline[inKey] = (ewStopline[inKey] || 0) + 1;
         }
       }
+      // 'x' cells don't contribute to queues — already past the light.
     }
   }
 
@@ -597,15 +695,36 @@ export function simulateTick(state) {
       continue;
     }
 
-    // Periodic congestion-aware reroute. Runs before computing next-cell so
-    // the move logic below uses the updated path. Cheap when the current
-    // path is still best (A* returns the same prefix).
+    // Periodic congestion-aware reroute (P2).
+    //
+    // Two correctness fixes over the naive version:
+    //
+    // 1. Booked load: when a car commits to a new path, every segment on that
+    //    path is added to `segmentLoad` immediately. Cars rerouting later in
+    //    the same tick see the updated load and avoid synchronising onto the
+    //    same "free" corridor (which would just become the next traffic jam).
+    //
+    // 2. Significant-improvement gate: only switch paths if the new path's
+    //    total cost is at least 10% cheaper than the current remaining path
+    //    under the same load. Without this, microscopic load shifts make
+    //    cars flap between equivalent routes and re-trigger oscillation.
     if (tick >= (car.nextRerouteTick ?? Infinity)) {
       const dest = ipos(car.destIr, car.destIc);
       const newPath = findPath(grid, car.pos, dest, segmentLoad);
       if (newPath && newPath.length >= 2) {
-        car.path = newPath;
-        car.pathIndex = 0;
+        const oldRemaining = car.path.slice(car.pathIndex);
+        const oldCost = pathCost(oldRemaining, segmentLoad);
+        const newCost = pathCost(newPath, segmentLoad);
+        if (newCost < oldCost * 0.9) {
+          car.path = newPath;
+          car.pathIndex = 0;
+          for (const p of newPath) {
+            if (p.kind === 's') {
+              const k = `${p.fromIr},${p.fromIc},${p.toIr},${p.toIc}`;
+              segmentLoad[k] = (segmentLoad[k] || 0) + 1;
+            }
+          }
+        }
       }
       car.nextRerouteTick = tick + REROUTE_INTERVAL;
     }
@@ -615,25 +734,41 @@ export function simulateTick(state) {
     const curKey  = posKey(current);
     const nextKey = posKey(next);
 
-    // Reroute when the next position is an intersection blocked by accident.
-    if (next.kind === 'i' && grid[next.ir][next.ic].hasAccident) {
+    // Reroute when the next position is inside an intersection now blocked
+    // by an accident (any 'x' cell of that intersection is blocked).
+    if (next.kind === 'x' && grid[next.ir][next.ic].hasAccident) {
       const dest = ipos(car.destIr, car.destIc);
       const newPath = findPath(grid, current, dest, segmentLoad);
       if (newPath && newPath.length >= 2) {
         cars[i] = { ...car, path: newPath, pathIndex: 0, pos: current, waiting: true };
         cars[i].waitTime++;
+        cars[i].consecutiveWait = (cars[i].consecutiveWait ?? 0) + 1;
+        if (cars[i].consecutiveWait >= MAX_WAIT) {
+          carsToRemove.add(i);
+          stats.abandoned++;
+          nextOccupied.delete(posKey(cars[i].pos));
+        }
       } else {
         car.waiting = true;
         car.waitTime++;
+        car.consecutiveWait = (car.consecutiveWait ?? 0) + 1;
+        if (car.consecutiveWait >= MAX_WAIT) {
+          carsToRemove.add(i);
+          stats.abandoned++;
+          nextOccupied.delete(curKey);
+        }
       }
       continue;
     }
 
-    // Traffic light check fires only when leaving an intersection.
+    // Traffic light gates entry into the intersection: car stepping from
+    // segment pos=SEG_CELLS-1 into an 'x' entry cell. Direction = the
+    // segment's travel direction. Inside the intersection, internal moves
+    // ('x' → 'x') are unrestricted so cars already past the bar can clear.
     let lightGreen = true;
-    if (current.kind === 'i' && next.kind === 's') {
-      const dir = dirOfSeg(current.ir, current.ic, next.toIr, next.toIc);
-      lightGreen = canPass(grid[current.ir][current.ic], dir);
+    if (current.kind === 's' && next.kind === 'x') {
+      const dir = dirOfSeg(current.fromIr, current.fromIc, current.toIr, current.toIc);
+      lightGreen = canPass(grid[next.ir][next.ic], dir);
     }
     const nextFree = !nextOccupied.has(nextKey);
 
@@ -642,11 +777,18 @@ export function simulateTick(state) {
       car.pathIndex++;
       car.pos = next;
       car.waiting = false;
+      car.consecutiveWait = 0;
       nextOccupied.add(nextKey);
       stats.greenCorridorCount = (stats.greenCorridorCount || 0) + 1;
     } else {
       car.waiting = true;
       car.waitTime++;
+      car.consecutiveWait = (car.consecutiveWait ?? 0) + 1;
+      if (car.consecutiveWait >= MAX_WAIT) {
+        carsToRemove.add(i);
+        stats.abandoned++;
+        nextOccupied.delete(curKey);
+      }
     }
   }
 
@@ -719,7 +861,7 @@ export function addAccident(state, row, col) {
     // Reroute cars whose remaining path passes through the blocked intersection.
     cars = cars.map((car) => {
       const passesThrough = car.path.slice(car.pathIndex + 1).some(
-        (p) => p.kind === 'i' && p.ir === row && p.ic === col
+        (p) => p.kind === 'x' && p.ir === row && p.ic === col
       );
       if (!passesThrough) return car;
 
